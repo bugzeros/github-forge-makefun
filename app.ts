@@ -17,6 +17,15 @@ const BASE_EPOCH = 1767225600; // 2026-01-01T00:00:00Z, deterministic
 let seq = 0;
 function nextSeq(): number { seq += 1; return seq; }
 function isoFor(n: number): string { return new Date((BASE_EPOCH + n) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z'); }
+// isoFor is pure in n and called for every serialized object; memoize it so
+// a timestamp string is built once (Date + toISOString per call was visible
+// in profiles of the issue read/write paths).
+const isoCache = new Map<number, string>();
+function isoForCached(n: number): string {
+  let s = isoCache.get(n);
+  if (s === undefined) { s = isoFor(n); isoCache.set(n, s); }
+  return s;
+}
 function sha1hex(data: Buffer): string { return crypto.createHash('sha1').update(data).digest('hex'); }
 
 // ---------------------------------------------------------------------------
@@ -204,19 +213,13 @@ function readVarint(buf: Buffer, pos: number): { value: number; next: number } {
   while (buf[i - 1] & 0x80) { value = ((value + 1) << 7) | (buf[i] & 0x7f); i += 1; }
   return { value, next: i };
 }
-// Inflate one zlib stream starting at `start`; find its exact end by binary search
-// (inflateSync ignores trailing bytes, and a truncated stream throws).
+// Inflate one zlib stream starting at `start`; the engine reports exactly
+// how many input bytes the stream consumed, so a single inflate finds its
+// end (a binary search over prefixes re-inflated the stream ~log2(n) times
+// per object, which dominated receive-pack time).
 function inflateOne(buf: Buffer, start: number): { data: Buffer; next: number } {
-  let lo = start + 1;
-  let hi = buf.length;
-  let ok = false;
-  try { zlib.inflateSync(buf.subarray(start, hi)); ok = true; } catch { ok = false; }
-  if (!ok) throw new Error('bad zlib stream in pack');
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try { zlib.inflateSync(buf.subarray(start, mid)); hi = mid; } catch { lo = mid + 1; }
-  }
-  return { data: zlib.inflateSync(buf.subarray(start, lo)), next: lo };
+  const { buffer: data, engine } = zlib.inflateSync(buf.subarray(start), { info: true });
+  return { data, next: start + engine.bytesWritten };
 }
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let p = 0;
@@ -339,6 +342,11 @@ interface IssueRec {
   number: number; id: number; title: string; body: string; state: 'open' | 'closed';
   labels: string[]; createdSeq: number; updatedSeq: number;
   comments: Array<{ id: number; body: string; createdSeq: number }>;
+  // Serialized-JSON cache: valid only while updatedSeq/comments match.
+  // Every mutation of a serialized field bumps updatedSeq (PATCH, comment
+  // add, GraphQL close/addComment), so a version check is a complete
+  // invalidation rule — no per-site invalidation to forget.
+  jsonCache: { buf: Buffer; updatedSeq: number; comments: number } | null;
 }
 interface PullRec {
   number: number; id: number; title: string; body: string; state: 'open' | 'closed';
@@ -390,7 +398,7 @@ function repoJson(r: Repo): Record<string, unknown> {
     private: r.isPrivate, description: r.description, fork: false,
     html_url: `https://github.com/${r.fullName}`, url: `https://api.github.com/repos/${r.fullName}`,
     default_branch: r.defaultBranch, has_issues: true, has_projects: true, has_wiki: true,
-    created_at: isoFor(r.createdSeq), updated_at: isoFor(r.createdSeq), pushed_at: isoFor(r.createdSeq),
+    created_at: isoForCached(r.createdSeq), updated_at: isoForCached(r.createdSeq), pushed_at: isoForCached(r.createdSeq),
     open_issues_count: r.issues.filter((i) => i.state === 'open').length,
   };
 }
@@ -400,10 +408,17 @@ function issueJson(r: Repo, i: IssueRec): Record<string, unknown> {
     labels: i.labels.map((name) => ({ name, color: r.labels.get(name)?.color ?? 'ededed' })),
     user: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
     assignee: null, assignees: [], comments: i.comments.length,
-    created_at: isoFor(i.createdSeq), updated_at: isoFor(i.updatedSeq),
+    created_at: isoForCached(i.createdSeq), updated_at: isoForCached(i.updatedSeq),
     html_url: `https://github.com/${r.fullName}/issues/${i.number}`,
     url: `https://api.github.com/repos/${r.fullName}/issues/${i.number}`,
   };
+}
+function issueJsonBuf(r: Repo, i: IssueRec): Buffer {
+  const c = i.jsonCache;
+  if (c && c.updatedSeq === i.updatedSeq && c.comments === i.comments.length) return c.buf;
+  const buf = Buffer.from(JSON.stringify(issueJson(r, i)), 'utf8');
+  i.jsonCache = { buf, updatedSeq: i.updatedSeq, comments: i.comments.length };
+  return buf;
 }
 function pullJson(r: Repo, p: PullRec): Record<string, unknown> {
   return {
@@ -413,7 +428,7 @@ function pullJson(r: Repo, p: PullRec): Record<string, unknown> {
     head: { ref: p.headRef, sha: p.headSha, label: `${VIEWER.login}:${p.headRef}` },
     base: { ref: p.baseRef, sha: p.baseSha, label: `${VIEWER.login}:${p.baseRef}` },
     user: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
-    created_at: isoFor(p.createdSeq), updated_at: isoFor(p.updatedSeq),
+    created_at: isoForCached(p.createdSeq), updated_at: isoForCached(p.updatedSeq),
     html_url: `https://github.com/${r.fullName}/pull/${p.number}`,
     url: `https://api.github.com/repos/${r.fullName}/pulls/${p.number}`,
   };
@@ -608,6 +623,12 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown, extra
   res.writeHead(status, headers);
   res.end(data);
 }
+function sendJsonBuf(res: http.ServerResponse, status: number, buf: Buffer): void {
+  // Same headers as sendJson (fresh x-github-request-id per response),
+  // but the body bytes are prebuilt (issue JSON cache) — no stringify.
+  res.writeHead(status, jsonHeaders());
+  res.end(buf);
+}
 function sendErr(res: http.ServerResponse, status: number, message: string): void {
   sendJson(res, status, { message });
 }
@@ -652,7 +673,9 @@ function paginate<T>(items: T[], url: URL, req: http.IncomingMessage, res: http.
   return slice;
 }
 function parsePath(p: string): string[] {
-  return p.split('/').filter((s) => s.length > 0).map((s) => { try { return decodeURIComponent(s); } catch { return s; } });
+  // decodeURIComponent is a no-op (and never throws) for segments without '%',
+  // and hot paths (issue reads) are all plain ASCII segments.
+  return p.split('/').filter((s) => s.length > 0).map((s) => { if (!s.includes('%')) return s; try { return decodeURIComponent(s); } catch { return s; } });
 }
 
 // ---------------------------------------------------------------------------
@@ -982,7 +1005,7 @@ async function handleRest(req: http.IncomingMessage, res: http.ServerResponse, u
           const issue: IssueRec = {
             number: repo.issues.length + 1, id: ++issueIdSeq, title,
             body: typeof body.body === 'string' ? body.body : '', state: 'open', labels,
-            createdSeq: n, updatedSeq: n, comments: [],
+            createdSeq: n, updatedSeq: n, comments: [], jsonCache: null,
           };
           repo.issues.push(issue);
           repo.issuesByNum.set(issue.number, issue);
@@ -996,7 +1019,7 @@ async function handleRest(req: http.IncomingMessage, res: http.ServerResponse, u
       const issue = repo.issuesByNum.get(num);
       if (rest.length === 2) {
         if (!issue) { sendErr(res, 404, 'Not Found'); return true; }
-        if (method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return true; }
+        if (method === 'GET') { sendJsonBuf(res, 200, issueJsonBuf(repo, issue)); return true; }
         if (method === 'PATCH') {
           const parsed = await readJsonBody(req);
           if (!parsed.ok) { sendErr(res, 400, 'Problems parsing JSON'); return true; }
@@ -1010,7 +1033,7 @@ async function handleRest(req: http.IncomingMessage, res: http.ServerResponse, u
             issue.labels = labels;
           }
           issue.updatedSeq = nextSeq();
-          sendJson(res, 200, issueJson(repo, issue));
+          sendJsonBuf(res, 200, issueJsonBuf(repo, issue));
           return true;
         }
         sendErr(res, 404, 'Not Found');
@@ -1019,7 +1042,7 @@ async function handleRest(req: http.IncomingMessage, res: http.ServerResponse, u
       if (rest[2] === 'comments') {
         if (!issue) { sendErr(res, 404, 'Not Found'); return true; }
         if (method === 'GET') {
-          sendJson(res, 200, issue.comments.map((c) => ({ id: c.id, body: c.body, user: { login: VIEWER.login, id: VIEWER.id }, created_at: isoFor(c.createdSeq), updated_at: isoFor(c.createdSeq) })));
+          sendJson(res, 200, issue.comments.map((c) => ({ id: c.id, body: c.body, user: { login: VIEWER.login, id: VIEWER.id }, created_at: isoForCached(c.createdSeq), updated_at: isoForCached(c.createdSeq) })));
           return true;
         }
         if (method === 'POST') {
@@ -1030,7 +1053,7 @@ async function handleRest(req: http.IncomingMessage, res: http.ServerResponse, u
           const c = { id: ++commentIdSeq, body: body.body, createdSeq: nextSeq() };
           issue.comments.push(c);
           issue.updatedSeq = nextSeq();
-          sendJson(res, 201, { id: c.id, body: c.body, user: { login: VIEWER.login, id: VIEWER.id }, created_at: isoFor(c.createdSeq), updated_at: isoFor(c.createdSeq) });
+          sendJson(res, 201, { id: c.id, body: c.body, user: { login: VIEWER.login, id: VIEWER.id }, created_at: isoForCached(c.createdSeq), updated_at: isoForCached(c.createdSeq) });
           return true;
         }
         sendErr(res, 404, 'Not Found');
@@ -1351,13 +1374,13 @@ function handleFetchV2(repo: Repo, args: string[]): Buffer {
   parts.push(pktFlush());
   return Buffer.concat(parts);
 }
-function handleFetchV0(repo: Repo, body: Buffer): Buffer {
-  const packets = decodePktLines(body);
+function handleFetchV0(repo: Repo, body: Buffer, packets?: Pkt[]): Buffer {
+  const pk = packets ?? decodePktLines(body);
   const wants: string[] = [];
   const haves: string[] = [];
   let depth: number | null = null;
   let sawFlush = false;
-  for (const p of packets) {
+  for (const p of pk) {
     if (p.kind === 'flush') { sawFlush = true; continue; }
     if (p.kind !== 'data') continue;
     const line = p.payload.toString('utf8').replace(/\n$/, '');
@@ -1479,15 +1502,10 @@ async function handleGit(req: http.IncomingMessage, res: http.ServerResponse, pa
     res.end(out);
     return true;
   }
-  // git-upload-pack: v2 command or v0 fetch
-  const first = body.subarray(0, 4).toString('ascii');
-  const isV2 = body.length > 4 && (() => {
-    const pk = decodePktLines(body);
-    return pk.some((p) => p.kind === 'data' && p.payload.toString('utf8').startsWith('command='));
-  })();
-  void first;
+  // git-upload-pack: v2 command or v0 fetch (decode the body once and reuse it)
+  const pk = decodePktLines(body);
+  const isV2 = body.length > 4 && pk.some((p) => p.kind === 'data' && p.payload.toString('utf8').startsWith('command='));
   if (isV2) {
-    const pk = decodePktLines(body);
     const lines: string[] = [];
     let command = '';
     let inArgs = false;
@@ -1514,7 +1532,7 @@ async function handleGit(req: http.IncomingMessage, res: http.ServerResponse, pa
     res.end(out);
     return true;
   }
-  const out = handleFetchV0(repo, body);
+  const out = handleFetchV0(repo, body, pk);
   res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
   res.end(out);
   return true;
@@ -1724,7 +1742,7 @@ function repoGql(r: Repo): Record<string, unknown> {
     owner: { __type: 'User', login: VIEWER.login, id: gid('User', VIEWER.id), name: VIEWER.name, email: VIEWER.email },
     defaultBranchRef: r.tip() ? { __type: 'Ref', name: r.defaultBranch, target: { oid: r.tip() } } : null,
     viewerPermission: 'ADMIN', hasIssuesEnabled: true,
-    url: `https://github.com/${r.fullName}`, createdAt: isoFor(r.createdSeq), updatedAt: isoFor(r.createdSeq),
+    url: `https://github.com/${r.fullName}`, createdAt: isoForCached(r.createdSeq), updatedAt: isoForCached(r.createdSeq),
     description: r.description, isPrivate: r.isPrivate, fork: false,
   };
 }
@@ -1734,7 +1752,7 @@ function issueGql(r: Repo, i: IssueRec): Record<string, unknown> {
     id: gid('Issue', r.id, i.number), databaseId: i.id, number: i.number, title: i.title, body: i.body,
     state: i.state === 'open' ? 'OPEN' : 'CLOSED',
     author: { __type: 'User', login: VIEWER.login, id: gid('User', VIEWER.id), name: VIEWER.name, email: VIEWER.email },
-    createdAt: isoFor(i.createdSeq), updatedAt: isoFor(i.updatedSeq),
+    createdAt: isoForCached(i.createdSeq), updatedAt: isoForCached(i.updatedSeq),
     url: `https://github.com/${r.fullName}/issues/${i.number}`,
     comments: { __type: 'IssueCommentConnection', __repo: r, __issue: i },
     labels: { __type: 'LabelConnection', nodes: i.labels.map((l) => ({ name: l })) },
@@ -1750,7 +1768,7 @@ function pullGql(r: Repo, p: PullRec): Record<string, unknown> {
     mergeable: 'MERGEABLE', merged: p.merged, mergedAt: p.mergedAt,
     mergeCommit: p.mergeCommitSha ? { oid: p.mergeCommitSha } : null,
     author: { __type: 'User', login: VIEWER.login, id: gid('User', VIEWER.id), name: VIEWER.name, email: VIEWER.email },
-    createdAt: isoFor(p.createdSeq), updatedAt: isoFor(p.updatedSeq),
+    createdAt: isoForCached(p.createdSeq), updatedAt: isoForCached(p.updatedSeq),
     url: `https://github.com/${r.fullName}/pull/${p.number}`,
     files: { __type: 'PullRequestFileConnection', __repo: r, __pull: p },
   };
@@ -1893,7 +1911,7 @@ class GqlExecutor {
       const r = parent.__repo as Repo;
       const i = parent.__issue as IssueRec;
       if (field.name === 'nodes') {
-        return i.comments.map((c) => sub({ __type: 'IssueComment', id: gid('IssueComment', r.id, i.number, c.id), databaseId: c.id, body: c.body, author: { __type: 'User', login: VIEWER.login, id: gid('User', VIEWER.id) }, createdAt: isoFor(c.createdSeq) }, 'IssueComment'));
+        return i.comments.map((c) => sub({ __type: 'IssueComment', id: gid('IssueComment', r.id, i.number, c.id), databaseId: c.id, body: c.body, author: { __type: 'User', login: VIEWER.login, id: gid('User', VIEWER.id) }, createdAt: isoForCached(c.createdSeq) }, 'IssueComment'));
       }
       if (field.name === 'totalCount') return i.comments.length;
       if (field.name === 'pageInfo') return sub(pageInfoFor(i.comments, -1, i.comments.length), 'PageInfo');
@@ -1950,7 +1968,7 @@ class GqlExecutor {
       const issue: IssueRec = {
         number: r.issues.length + 1, id: ++issueIdSeq, title: String(input.title ?? ''),
         body: typeof input.body === 'string' ? input.body : '', state: 'open', labels: [],
-        createdSeq: n, updatedSeq: n, comments: [],
+        createdSeq: n, updatedSeq: n, comments: [], jsonCache: null,
       };
       r.issues.push(issue);
       r.issuesByNum.set(issue.number, issue);
@@ -2009,7 +2027,7 @@ class GqlExecutor {
       return {
         value: {
           __type: 'AddCommentPayload',
-          commentEdge: { node: { __type: 'IssueComment', id: gid('IssueComment', r.id, i.number, c.id), databaseId: c.id, body: c.body, author: { __type: 'User', login: VIEWER.login, id: gid('User', VIEWER.id) }, createdAt: isoFor(c.createdSeq) } },
+          commentEdge: { node: { __type: 'IssueComment', id: gid('IssueComment', r.id, i.number, c.id), databaseId: c.id, body: c.body, author: { __type: 'User', login: VIEWER.login, id: gid('User', VIEWER.id) }, createdAt: isoForCached(c.createdSeq) } },
           clientMutationId: (input.clientMutationId as string | null) ?? null,
         },
         type: 'AddCommentPayload',
@@ -2098,7 +2116,7 @@ function mcpCall(name: string, args: Record<string, unknown>): Record<string, un
       const issue: IssueRec = {
         number: repo.issues.length + 1, id: ++issueIdSeq, title,
         body: typeof args.body === 'string' ? args.body : '', state: 'open', labels,
-        createdSeq: n, updatedSeq: n, comments: [],
+        createdSeq: n, updatedSeq: n, comments: [], jsonCache: null,
       };
       repo.issues.push(issue);
       repo.issuesByNum.set(issue.number, issue);
